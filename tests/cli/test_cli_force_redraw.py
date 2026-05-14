@@ -71,40 +71,56 @@ class TestForceFullRedraw:
             "invalidate",
         ]
 
-    def test_resize_preserves_scrollback_and_resets_renderer(self, bare_cli, monkeypatch):
-        """Resize recovery must NOT erase screen or scrollback.
+    def test_resize_clears_and_replays_scrollback(self, bare_cli, monkeypatch):
+        """Resize recovery clears the physical screen and replays scrollback.
 
-        The startup banner lives in normal terminal scrollback (printed
-        before prompt_toolkit owns the chrome).  Clearing scrollback on
-        SIGWINCH removes it and ``_replay_output_history`` cannot
-        reconstruct it.  The fix is to only reset the renderer cache and
-        let ``original_on_resize`` recalculate layout.
+        Earlier iterations (#25975, #24403) tried to keep the screen
+        untouched on SIGWINCH and just suppress new chrome until the next
+        prompt.  That approach left already-reflowed input bars visible
+        above the new chrome — the "duplicated input bar" report — because
+        prompt_toolkit's ``renderer.erase`` only cursor_up()s by the stored
+        logical layout height, not by the physical extras created when the
+        terminal emulator reflowed full-width rows.
 
-        Additionally, ``_status_bar_suppressed_after_resize`` must be set
-        so the input rules and status bar hide until the next user input,
-        preventing duplicated-bar artifacts on column shrink (#19280).
+        The current approach mirrors what claude-code's Ink renderer does:
+        let prompt_toolkit recompute layout, clear the viewport (``\\x1b[2J``
+        leaves true scrollback intact), then replay tracked scrollback so
+        the banner + recent chat are reconstructed cleanly.
+
+        ``_status_bar_suppressed_after_resize`` is still set so subsequent
+        resizes landing mid-redraw don't re-reflow chrome.
         """
         app = MagicMock()
         events = []
+        out = app.renderer.output
+        out.erase_screen.side_effect = lambda: events.append("erase")
+        out.cursor_goto.side_effect = lambda *_: events.append("home")
+        out.flush.side_effect = lambda: events.append("flush")
         app.renderer.reset.side_effect = lambda **_: events.append("renderer_reset")
         app.invalidate.side_effect = lambda: events.append("invalidate")
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
         original_on_resize = lambda: events.append("original_resize")
 
         # bare_cli skips __init__, so seed the attribute the way __init__ would.
         bare_cli._status_bar_suppressed_after_resize = False
         bare_cli._recover_after_resize(app, original_on_resize)
 
-        assert events == [
-            "renderer_reset",
-            "invalidate",
-            "original_resize",
-        ]
-        # Must NOT clear the screen or scrollback — those destroy the banner.
-        app.renderer.output.erase_screen.assert_not_called()
-        app.renderer.output.write_raw.assert_not_called()
-        app.renderer.output.cursor_goto.assert_not_called()
+        # Contract: original_on_resize runs first so prompt_toolkit's layout
+        # is sized for the new dimensions before the screen is touched.
+        # Then erase_screen + cursor home wipe the visible chrome reflow.
+        # Then replay rebuilds banner + chat.  Then invalidate schedules a
+        # final repaint.  Sequence assertions kept loose to tolerate future
+        # incidental writes (e.g. reset_attributes) that don't affect outcome.
+        assert events[0] == "original_resize", events
+        assert "erase" in events, events
+        assert "home" in events, events
+        assert "replay" in events, events
+        assert events[-1] == "invalidate", events
         # Status bar / input rules must be suppressed until the next prompt.
         assert bare_cli._status_bar_suppressed_after_resize is True
+        # Must NOT write \x1b[3J (erase scrollback): the user's session
+        # history above the viewport stays intact.
+        out.write_raw.assert_not_called()
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
         app = MagicMock()

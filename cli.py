@@ -2714,37 +2714,68 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Recover a resized classic CLI without desynchronizing cursor state.
+        """Recover a resized classic CLI by clearing and replaying scrollback.
 
-        Unlike _force_full_redraw, we do NOT clear the physical screen or
-        scrollback here.  The startup banner and tool summary are printed
-        before prompt_toolkit owns the live chrome, so they live in normal
-        terminal scrollback.  Erasing the screen on SIGWINCH removes that
-        startup UI and ``_replay_output_history`` cannot reconstruct it
-        (the banner was never added to ``_OUTPUT_HISTORY``).
+        Why a full clear-and-replay: when the terminal column count changes,
+        the emulator reflows already-printed full-width rows (status bar,
+        input rules, banner) into multiple narrower rows.  prompt_toolkit's
+        renderer tracks ``_cursor_pos.y`` from the last logical layout —
+        not from the post-reflow physical cursor position — so its own
+        ``erase()`` (cursor_up(y) + erase_down) misses the extras created by
+        reflow.  The leftover rows are what users see as a "duplicated input
+        bar" after every resize (#19280, #22976).
 
-        Instead we just reset prompt_toolkit's renderer cache so the next
-        incremental redraw starts from a clean slate, then let
-        ``original_on_resize`` recalculate layout for the new size.
+        Trying to compute the exact drift is fragile and emulator-specific
+        (#17691 / #19280 attempted this and missed cases).  Instead we do
+        what claude-code's Ink-based renderer does on resize: clear the
+        physical screen + cursor-home + replay tracked scrollback (banner +
+        recent chat output).  Native ``erase_screen``/``\\x1b[2J`` clears the
+        viewport but leaves true scrollback intact, so the user keeps their
+        history; the replay just rebuilds what's currently *visible*.
+
+        Order matters here:
+
+        1. ``original_on_resize()`` first so prompt_toolkit recomputes
+           layout for the new dimensions.  Its ``renderer.erase`` writes
+           ``cursor_up(stale_y) + erase_down`` which doesn't clean up the
+           reflow extras, but that's fine — step 2 wipes the whole screen.
+        2. ``_clear_prompt_toolkit_screen`` writes ``\\x1b[2J`` + home and
+           resets the renderer's diff cache so the next paint writes every
+           cell from a known (0,0) origin.
+        3. ``_replay_output_history`` repaints banner + chat above the
+           prompt.  ``_pt_print`` uses ``run_in_terminal`` which is
+           cursor-position aware: it erases the live chrome, prints
+           history, then re-renders the chrome — leaving a clean stack of
+           banner → scrollback → status bar → input.
 
         We also flag ``_status_bar_suppressed_after_resize`` so the dynamic
         status bar and input separator rules stay hidden until the next user
-        input.  On column shrink the terminal reflows already-rendered status
-        bar rows into scrollback before prompt_toolkit can erase them; drawing
-        a fresh full-width bar immediately makes the old and new versions
-        look duplicated (#19280, #22976).  Clearing the suppression on the
-        next prompt restores the bar cleanly.
+        input.  If a second resize lands while we're mid-redraw, suppressing
+        chrome shrinks the surface area that can re-reflow.
         """
         self._status_bar_suppressed_after_resize = True
+        # 1. Let prompt_toolkit recompute layout for the new size.
         try:
-            app.renderer.reset(leave_alternate_screen=False)
+            original_on_resize()
+        except Exception:
+            pass
+        # 2. Physical clear + cursor home + drop pt's diff cache so the next
+        #    paint starts from (0,0) with no stale-frame interference.
+        try:
+            self._clear_prompt_toolkit_screen(app)
+        except Exception:
+            pass
+        # 3. Repaint banner + recent chat above the live prompt.  _pt_print
+        #    schedules via run_in_terminal so it's safely interleaved with
+        #    prompt_toolkit's own render cycle.
+        try:
+            _replay_output_history()
         except Exception:
             pass
         try:
             app.invalidate()
         except Exception:
             pass
-        original_on_resize()
 
     def _schedule_resize_recovery(self, app, original_on_resize, delay: float = 0.12) -> None:
         """Debounce resize redraws so footer chrome is not stamped into scrollback."""
@@ -4307,12 +4338,56 @@ class HermesCLI:
         ctx_len = None
         if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
             ctx_len = self.agent.context_compressor.context_length
-        
+
         # Auto-compact for narrow terminals — the full banner with caduceus
         # + tool list needs ~80 columns minimum to render without wrapping.
         term_width = shutil.get_terminal_size().columns
         use_compact = self.compact or term_width < 80
-        
+
+        # Record a callable so the banner is re-rendered at current terminal
+        # width during resize-recovery replay (#22976). Without this, a full
+        # screen clear during resize would wipe the banner from scrollback
+        # and replay would only restore chat content, leaving the top of the
+        # viewport empty.
+        def _render_banner_for_replay() -> str:
+            """Re-render the banner to ANSI for resize replay."""
+            try:
+                from io import StringIO as _StringIO
+                buf = _StringIO()
+                # New console pinned to current terminal width so the banner
+                # reflows correctly after the user resizes.
+                _ctx_len = None
+                if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                    _ctx_len = self.agent.context_compressor.context_length
+                _w = shutil.get_terminal_size((80, 24)).columns
+                _compact = self.compact or _w < 80
+                _con = Console(
+                    file=buf,
+                    force_terminal=True,
+                    color_system="truecolor",
+                    highlight=False,
+                    width=_w,
+                )
+                if _compact:
+                    _con.print(_build_compact_banner())
+                else:
+                    _tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                    _cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+                    build_welcome_banner(
+                        console=_con,
+                        model=self.model,
+                        cwd=_cwd,
+                        tools=_tools,
+                        enabled_toolsets=self.enabled_toolsets,
+                        session_id=self.session_id,
+                        context_length=_ctx_len,
+                    )
+                return buf.getvalue().rstrip("\n")
+            except Exception:
+                return ""
+
+        _record_output_history_entry(_render_banner_for_replay)
+
         if use_compact:
             self._console_print(_build_compact_banner())
             self._show_status()
@@ -13057,18 +13132,20 @@ class HermesCLI:
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
         # When the terminal shrinks (e.g. un-maximize), the emulator reflows
-        # the previously-rendered full-width rows (status bar, input rules)
-        # into multiple narrower rows.  prompt_toolkit's _on_resize handler
-        # only cursor_up()s by the stored layout height, missing the extra
-        # rows created by reflow — leaving ghost duplicates visible.
+        # the previously-rendered full-width rows (status bar, input rules,
+        # banner) into multiple narrower rows.  prompt_toolkit's _on_resize
+        # handler only cursor_up()s by the stored logical layout height,
+        # missing the extra rows created by reflow — leaving ghost
+        # duplicates of the input bar above the new chrome.
         #
         # It's not just column-shrink: widening, row-shrinking, and
         # multiplexer-driven SIGWINCH-less redraws (cmux / tmux tab switch)
         # all produce the same class of drift, where the renderer's tracked
-        # _cursor_pos.y no longer matches terminal reality. The only reliable
-        # recovery is a full screen-clear (\x1b[2J\x1b[H) before the next
-        # redraw, so we force one on every resize rather than trying to
-        # compute the exact drift.
+        # _cursor_pos.y no longer matches terminal reality. The only
+        # reliable recovery is a full screen-clear (\x1b[2J\x1b[H) + replay
+        # of tracked scrollback (banner + recent chat) before the next
+        # redraw — see _recover_after_resize for the full rationale.
+        # This mirrors what claude-code's Ink renderer does on resize.
         _original_on_resize = app._on_resize
 
         def _resize_clear_ghosts():
