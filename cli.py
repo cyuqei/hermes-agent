@@ -11287,16 +11287,12 @@ class HermesCLI:
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
-        # Push the entire TUI to the bottom of the terminal so the banner,
-        # responses, and prompt all appear pinned to the bottom — empty
-        # space stays above, not below.  This prints enough blank lines to
-        # scroll the cursor to the last row before any content is rendered.
-        try:
-            _term_lines = shutil.get_terminal_size().lines
-            if _term_lines > 2:
-                print("\n" * (_term_lines - 1), end="", flush=True)
-        except Exception:
-            pass
+        # NOTE: we intentionally avoid pre-filling the terminal with blank
+        # lines to "pin" the UI at the bottom. That strategy causes severe
+        # scrollback amplification under resize in non-alt-screen terminals
+        # (duplicated input/status snapshots separated by large whitespace
+        # blocks when users scroll).
+        pass
 
         self.show_banner()
         # Surface any active supply-chain security advisories right after the
