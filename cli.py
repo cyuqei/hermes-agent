@@ -2748,13 +2748,11 @@ class HermesCLI:
             # via its normal resize path (CPR + redraw). Calling the original
             # handler *after* the clear is safe: _cursor_pos is now (0,0), so
             # erase() cannot leak stale reflow rows into scrollback.
+            # NOTE: original_on_resize already triggers a redraw; avoid a
+            # second invalidate here (that extra pass can stamp duplicate
+            # footer/input snapshots into scrollback on some terminals).
             original_on_resize()
         except Exception:
-            try:
-                app.invalidate()
-            except Exception:
-                pass
-        else:
             try:
                 app.invalidate()
             except Exception:
