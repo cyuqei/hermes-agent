@@ -2714,42 +2714,12 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Recover resize drift without duplicating prior output.
+        """Compatibility no-op wrapper.
 
-        Terminal emulators reflow already-rendered full-width rows when
-        columns change. prompt_toolkit's native ``_on_resize`` erases by
-        stale logical height, so reflow extras remain visible (the
-        duplicated input/status bars bug).
-
-        We fix this by clearing ONLY the visible viewport
-        (``\x1b[2J\x1b[H`` via ``_clear_prompt_toolkit_screen``) and then
-        invalidating so prompt_toolkit repaints live chrome at the new
-        dimensions.
-
-        Intentionally *no history replay* here:
-        - Replaying while preserving scrollback duplicates the intro and
-          chat every resize (user-reported).
-        - Erasing scrollback (``\x1b[3J``) avoids duplicates but destroys
-          the user's pre-Hermes terminal history.
-
-        This gives idempotent resize behavior in normal non-alt-screen
-        terminals: clean prompt/input bar after each resize, no repeated
-        intro spam, no scrollback wipe.
+        Resize recovery is fully delegated to prompt_toolkit's native
+        ``Application._on_resize`` path. We keep this method only so older
+        call sites/tests importing it don't break.
         """
-        # Don't hard-clear the viewport on every SIGWINCH: in non-alt-screen
-        # mode that can stamp large filler whitespace snapshots into scrollback
-        # (visible when users scroll up/down after resizing).
-        #
-        # Instead, reset prompt_toolkit's cached renderer state and then let
-        # its native resize path recompute layout + redraw in-place.
-        try:
-            app.renderer.reset(leave_alternate_screen=False)
-        except Exception:
-            pass
-
-        # Keep chrome visible after resize.
-        self._status_bar_suppressed_after_resize = False
-
         try:
             original_on_resize()
         except Exception:
@@ -2757,52 +2727,16 @@ class HermesCLI:
                 app.invalidate()
             except Exception:
                 pass
-        del original_on_resize  # keep signature compatibility; no later use here.
 
     def _schedule_resize_recovery(self, app, original_on_resize, delay: float = 0.12) -> None:
-        """Debounce resize redraws so footer chrome is not stamped into scrollback."""
-        try:
-            old_timer = getattr(self, "_resize_recovery_timer", None)
-            lock = getattr(self, "_resize_recovery_lock", None)
-            if lock is None:
-                lock = threading.Lock()
-                self._resize_recovery_lock = lock
+        """Compatibility passthrough.
 
-            def _timer_fired(timer_ref):
-                def _run_recovery():
-                    with lock:
-                        if getattr(self, "_resize_recovery_timer", None) is not timer_ref:
-                            return
-                        self._resize_recovery_timer = None
-                        self._resize_recovery_pending = False
-                    self._recover_after_resize(app, original_on_resize)
-
-                try:
-                    loop = app.loop  # type: ignore[attr-defined]
-                except Exception:
-                    loop = None
-                if loop is not None:
-                    try:
-                        loop.call_soon_threadsafe(_run_recovery)
-                        return
-                    except Exception:
-                        pass
-                _run_recovery()
-
-            with lock:
-                if old_timer is not None:
-                    try:
-                        old_timer.cancel()
-                    except Exception:
-                        pass
-                self._resize_recovery_pending = True
-                timer = threading.Timer(delay, lambda: _timer_fired(timer))
-                timer.daemon = True
-                self._resize_recovery_timer = timer
-                timer.start()
-        except Exception:
-            self._resize_recovery_pending = False
-            self._recover_after_resize(app, original_on_resize)
+        Resize handling now delegates to prompt_toolkit's native
+        ``_on_resize`` call path. Keep this method so older tests/callers
+        don't break, but run recovery immediately with no timer/debounce.
+        """
+        del delay
+        self._recover_after_resize(app, original_on_resize)
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -13108,28 +13042,17 @@ class HermesCLI:
         _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
 
-        # ── Fix ghost status-bar lines on terminal resize ──────────────
-        # When the terminal shrinks (e.g. un-maximize), the emulator reflows
-        # the previously-rendered full-width rows (status bar, input rules,
-        # banner) into multiple narrower rows.  prompt_toolkit's _on_resize
-        # handler only cursor_up()s by the stored logical layout height,
-        # missing the extra rows created by reflow — leaving ghost
-        # duplicates of the input bar above the new chrome.
-        #
-        # It's not just column-shrink: widening, row-shrinking, and
-        # multiplexer-driven SIGWINCH-less redraws (cmux / tmux tab switch)
-        # all produce the same class of drift, where the renderer's tracked
-        # _cursor_pos.y no longer matches terminal reality. The only
-        # reliable recovery is a full screen-clear (\x1b[2J\x1b[H) + replay
-        # of tracked scrollback (banner + recent chat) before the next
-        # redraw — see _recover_after_resize for the full rationale.
-        # This mirrors what claude-code's Ink renderer does on resize.
+        # Resize handling is delegated to prompt_toolkit's native _on_resize.
+        # We intentionally avoid wrapping/debouncing _on_resize here: custom
+        # recovery paths ended up coupling resize to replay/scrollback behavior
+        # and caused repeated footer snapshots in non-alt-screen terminals.
+        # Keep one source of truth: prompt_toolkit owns resize reflow + redraw.
         _original_on_resize = app._on_resize
 
-        def _resize_clear_ghosts():
-            self._schedule_resize_recovery(app, _original_on_resize)
+        def _native_resize_passthrough():
+            _original_on_resize()
 
-        app._on_resize = _resize_clear_ghosts
+        app._on_resize = _native_resize_passthrough
 
         def spinner_loop():
             while not self._should_exit:
