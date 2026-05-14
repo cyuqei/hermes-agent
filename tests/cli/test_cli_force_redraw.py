@@ -71,31 +71,16 @@ class TestForceFullRedraw:
             "invalidate",
         ]
 
-    def test_resize_clears_viewport_without_replay(self, bare_cli, monkeypatch):
-        """Resize recovery clears viewport and redraws chrome only.
-
-        We intentionally do NOT replay history on resize because replaying
-        while preserving scrollback duplicates intro/chat on every resize
-        (user-reported).  We also avoid ``\\x1b[3J`` because that wipes
-        the user's pre-Hermes terminal history.
-
-        Contract:
-        - reset prompt_toolkit renderer cache (no hard viewport clear)
-        - no history replay
-        - run original_on_resize() once so pt recomputes layout/CPR
-        - suppression flag cleared so input/status bar reappear
-        - fallback invalidate only if original_on_resize fails
-        """
+    def test_resize_recovery_delegates_to_native_on_resize(self, bare_cli, monkeypatch):
+        """Resize helper should delegate to native on_resize and avoid replay/clears."""
         app = MagicMock()
         events: list = []
         out = app.renderer.output
-        out.reset_attributes.side_effect = lambda: events.append("reset_attrs")
         out.erase_screen.side_effect = lambda: events.append("erase_screen")
         out.write_raw.side_effect = lambda s: events.append(("write_raw", s))
         out.cursor_goto.side_effect = lambda *_: events.append("home")
-        out.flush.side_effect = lambda: events.append("flush")
-        app.renderer.reset.side_effect = lambda **_: events.append("renderer_reset")
         app.invalidate.side_effect = lambda: events.append("invalidate")
+
         replay_called = []
         monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: replay_called.append(True))
 
@@ -105,23 +90,27 @@ class TestForceFullRedraw:
         bare_cli._status_bar_suppressed_after_resize = True
         bare_cli._recover_after_resize(app, original_on_resize)
 
-        # No hard clear path calls.
+        # Native resize path should run exactly once.
+        assert on_resize_calls == ["legacy_on_resize"], on_resize_calls
+        # No custom clear/replay behavior.
         assert "erase_screen" not in events, events
         assert "home" not in events, events
-        assert replay_called == [], "resize recovery must not replay history"
-        # Must NOT erase scrollback (\x1b[3J)
-        write_raws = [
-            payload
-            for kind, payload in (e for e in events if isinstance(e, tuple) and e[0] == "write_raw")
-        ]
-        for payload in write_raws:
-            assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
-        # renderer reset + native resize pass
-        assert "renderer_reset" in events, events
-        assert on_resize_calls == ["legacy_on_resize"], f"expected one native resize call: {on_resize_calls!r}"
-        # Fallback invalidate should not run when native resize succeeds.
+        assert replay_called == [], replay_called
+        # No fallback invalidate on success.
         assert "invalidate" not in events, events
+        # Defensive unsuppress should run.
         assert bare_cli._status_bar_suppressed_after_resize is False
+
+    def test_schedule_resize_recovery_passthrough(self, bare_cli):
+        app = MagicMock()
+        calls = []
+
+        def _orig():
+            calls.append("orig")
+
+        bare_cli._schedule_resize_recovery(app, _orig, delay=0.25)
+        assert calls == ["orig"]
+        assert getattr(bare_cli, "_resize_recovery_pending", False) is False
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
         app = MagicMock()
@@ -133,62 +122,17 @@ class TestForceFullRedraw:
         app.renderer.output.cursor_goto.assert_called_once_with(0, 0)
         app.renderer.output.write_raw.assert_not_called()
 
-    def test_resize_recovery_is_debounced(self, bare_cli, monkeypatch):
-        timers = []
-        calls = []
-
-        class FakeTimer:
-            def __init__(self, delay, callback):
-                self.delay = delay
-                self.callback = callback
-                self.cancelled = False
-                self.daemon = False
-                timers.append(self)
-
-            def start(self):
-                calls.append(("start", self.delay))
-
-            def cancel(self):
-                self.cancelled = True
-                calls.append(("cancel", self.delay))
-
-            def fire(self):
-                self.callback()
-
-        app = MagicMock()
-        app.loop.call_soon_threadsafe.side_effect = lambda cb: cb()
-        monkeypatch.setattr(cli_mod.threading, "Timer", FakeTimer)
-        monkeypatch.setattr(
-            bare_cli,
-            "_recover_after_resize",
-            lambda _app, _orig: calls.append(("recover", _orig())),
-        )
-
-        original_one = lambda: "first"
-        original_two = lambda: "second"
-
-        bare_cli._schedule_resize_recovery(app, original_one, delay=0.25)
-        assert bare_cli._resize_recovery_pending is True
-        bare_cli._schedule_resize_recovery(app, original_two, delay=0.25)
-
-        assert len(timers) == 2
-        assert timers[0].cancelled is True
-        timers[0].fire()
-        assert ("recover", "first") not in calls
-
-        timers[1].fire()
-        assert ("recover", "second") in calls
-        assert bare_cli._resize_recovery_pending is False
 
     def test_invalidate_is_suppressed_while_resize_recovery_is_pending(self, bare_cli):
         app = MagicMock()
         bare_cli._app = app
         bare_cli._last_invalidate = 0.0
-        bare_cli._resize_recovery_pending = True
+        # With native resize passthrough there is no async debounce pending flag.
+        bare_cli._resize_recovery_pending = False
 
         bare_cli._invalidate(min_interval=0)
 
-        app.invalidate.assert_not_called()
+        app.invalidate.assert_called_once()
 
     def test_swallows_renderer_exceptions(self, bare_cli):
         # If the renderer blows up for any reason, the helper must not

@@ -2714,12 +2714,12 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Compatibility no-op wrapper.
+        """Compatibility wrapper delegating to prompt_toolkit native resize.
 
-        Resize recovery is fully delegated to prompt_toolkit's native
-        ``Application._on_resize`` path. We keep this method only so older
-        call sites/tests importing it don't break.
+        Keep this method so older call sites/tests importing it don't break.
         """
+        # Defensive: if older code left this latched, don't hide chrome.
+        self._status_bar_suppressed_after_resize = False
         try:
             original_on_resize()
         except Exception:
@@ -2727,6 +2727,7 @@ class HermesCLI:
                 app.invalidate()
             except Exception:
                 pass
+        del original_on_resize
 
     def _schedule_resize_recovery(self, app, original_on_resize, delay: float = 0.12) -> None:
         """Compatibility passthrough.
