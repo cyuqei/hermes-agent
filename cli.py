@@ -2736,17 +2736,30 @@ class HermesCLI:
         terminals: clean prompt/input bar after each resize, no repeated
         intro spam, no scrollback wipe.
         """
-        del original_on_resize  # intentionally unused
         try:
+            # First, wipe visible viewport + reset renderer state.
             self._clear_prompt_toolkit_screen(app)
         except Exception:
             pass
         # Ensure chrome is visible immediately after recovery.
         self._status_bar_suppressed_after_resize = False
         try:
-            app.invalidate()
+            # After renderer.reset(), prompt_toolkit must re-anchor cursor
+            # via its normal resize path (CPR + redraw). Calling the original
+            # handler *after* the clear is safe: _cursor_pos is now (0,0), so
+            # erase() cannot leak stale reflow rows into scrollback.
+            original_on_resize()
         except Exception:
-            pass
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+        else:
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+        del original_on_resize  # keep signature compatibility; no later use here.
 
     def _schedule_resize_recovery(self, app, original_on_resize, delay: float = 0.12) -> None:
         """Debounce resize redraws so footer chrome is not stamped into scrollback."""

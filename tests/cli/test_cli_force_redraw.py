@@ -82,7 +82,8 @@ class TestForceFullRedraw:
         Contract:
         - clear viewport (\x1b[2J) + cursor home
         - no history replay
-        - no original_on_resize call
+        - call original_on_resize AFTER clear so prompt_toolkit re-anchors
+          cursor/layout at the new size from a clean (0,0) baseline
         - suppression flag cleared so input/status bar reappear
         - invalidate scheduled to redraw prompt chrome at new dimensions
         """
@@ -116,7 +117,9 @@ class TestForceFullRedraw:
         ]
         for payload in write_raws:
             assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
-        assert original_called == [], "original_on_resize must not be invoked"
+        assert original_called == [True], "original_on_resize should be invoked once after clear"
+        # Ensure on_resize runs after the clear primitive, not before.
+        assert events.index("erase_screen") < events.index("invalidate"), events
         assert bare_cli._status_bar_suppressed_after_resize is False
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
