@@ -2726,50 +2726,79 @@ class HermesCLI:
         bar" after every resize (#19280, #22976).
 
         Trying to compute the exact drift is fragile and emulator-specific
-        (#17691 / #19280 attempted this and missed cases).  Instead we do
-        what claude-code's Ink-based renderer does on resize: clear the
-        physical screen + cursor-home + replay tracked scrollback (banner +
-        recent chat output).  Native ``erase_screen``/``\\x1b[2J`` clears the
-        viewport but leaves true scrollback intact, so the user keeps their
-        history; the replay just rebuilds what's currently *visible*.
+        (#17691 / #19280 / #25975 attempted this and missed cases).
+        Instead we do what claude-code's Ink-based renderer does on resize:
+        clear the physical screen + cursor-home + repaint tracked scrollback
+        (banner + recent chat output).  Native ``erase_screen``/``\\x1b[2J``
+        clears the viewport but leaves true scrollback intact, so the user
+        keeps their session history; the replay just rebuilds what's
+        currently *visible*.
 
         Order matters here:
 
-        1. ``original_on_resize()`` first so prompt_toolkit recomputes
-           layout for the new dimensions.  Its ``renderer.erase`` writes
-           ``cursor_up(stale_y) + erase_down`` which doesn't clean up the
-           reflow extras, but that's fine — step 2 wipes the whole screen.
-        2. ``_clear_prompt_toolkit_screen`` writes ``\\x1b[2J`` + home and
-           resets the renderer's diff cache so the next paint writes every
-           cell from a known (0,0) origin.
-        3. ``_replay_output_history`` repaints banner + chat above the
-           prompt.  ``_pt_print`` uses ``run_in_terminal`` which is
-           cursor-position aware: it erases the live chrome, prints
-           history, then re-renders the chrome — leaving a clean stack of
-           banner → scrollback → status bar → input.
+        1. ``_clear_prompt_toolkit_screen`` writes ``\\x1b[2J`` + home and
+           resets the renderer's diff cache (``_cursor_pos`` → (0,0),
+           ``_last_screen`` → None) so the next paint writes every cell
+           from a known origin.  ``_min_available_height = 0`` makes
+           prompt_toolkit re-send a CPR on the next render to re-anchor.
+        2. Write the recorded history directly to the output via
+           ``write_raw`` — synchronously, NOT through ``_pt_print``.  The
+           latter schedules ``run_in_terminal`` on the event loop, which
+           means a second resize landing before the queued replay fires
+           can stack two history copies into the viewport.  Bypassing the
+           queue keeps each resize a single atomic clear + repaint.
+        3. ``app.invalidate()`` to schedule prompt_toolkit's own redraw of
+           the live chrome below the replayed scrollback.  On the next
+           render prompt_toolkit's renderer reads ``output.get_size()``
+           fresh, so we don't need to call the original ``_on_resize``
+           (which is what was leaking reflowed chrome in the first place).
+
+        ``original_on_resize`` is intentionally unused — kept in the
+        signature for API compatibility with ``_schedule_resize_recovery``
+        callers and existing tests.
 
         We also flag ``_status_bar_suppressed_after_resize`` so the dynamic
-        status bar and input separator rules stay hidden until the next user
-        input.  If a second resize lands while we're mid-redraw, suppressing
-        chrome shrinks the surface area that can re-reflow.
+        status bar and input separator rules stay hidden until the next
+        user input.  If a second resize lands while we're mid-redraw,
+        suppressing chrome shrinks the surface area that can re-reflow.
         """
+        del original_on_resize  # intentionally unused; see docstring
         self._status_bar_suppressed_after_resize = True
-        # 1. Let prompt_toolkit recompute layout for the new size.
-        try:
-            original_on_resize()
-        except Exception:
-            pass
-        # 2. Physical clear + cursor home + drop pt's diff cache so the next
-        #    paint starts from (0,0) with no stale-frame interference.
         try:
             self._clear_prompt_toolkit_screen(app)
         except Exception:
             pass
-        # 3. Repaint banner + recent chat above the live prompt.  _pt_print
-        #    schedules via run_in_terminal so it's safely interleaved with
-        #    prompt_toolkit's own render cycle.
+        # Synchronously write the tracked scrollback to the terminal so
+        # the banner + recent chat reappear above the prompt.  Inlining
+        # this (instead of going through _pt_print) avoids the
+        # async/run_in_terminal scheduling that lets concurrent resizes
+        # double-replay into the viewport.
         try:
-            _replay_output_history()
+            out = app.renderer.output
+            rendered: list[str] = []
+            for entry in tuple(_OUTPUT_HISTORY):
+                if callable(entry):
+                    try:
+                        result = entry()
+                    except Exception:
+                        continue
+                    if isinstance(result, str):
+                        rendered.extend(result.splitlines())
+                    else:
+                        try:
+                            rendered.extend(str(line) for line in result)
+                        except Exception:
+                            continue
+                else:
+                    rendered.append(str(entry))
+            if rendered:
+                # Each entry is one logical row — prompt_toolkit's print
+                # path uses \r\n on telnet-style frontends but raw \n is
+                # correct for vt100.  Trailing \n leaves the cursor on a
+                # blank row below the history so the next render's chrome
+                # doesn't overwrite the last replayed line.
+                out.write_raw("\n".join(rendered) + "\n")
+                out.flush()
         except Exception:
             pass
         try:
