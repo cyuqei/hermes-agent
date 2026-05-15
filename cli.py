@@ -11198,9 +11198,65 @@ class HermesCLI:
         this method.  Override this only when you need full control over widget
         ordering.
         """
+        # Top spacer: pushes the chrome (status bar, input area) to the
+        # BOTTOM of the screen.  Critical in alt-screen / full_screen mode
+        # where prompt_toolkit fills the entire terminal.
+        # If transcript is visible (has content), the transcript itself
+        # takes the flex weight and the top spacer collapses to 0.
+        cli_self = self
+        def _top_spacer_height():
+            try:
+                if cli_self._app is not None and getattr(cli_self._app, "full_screen", False):
+                    if not _OUTPUT_HISTORY:
+                        return Dimension(min=0, weight=1)
+            except Exception:
+                pass
+            return 0
+
+        def _transcript_text():
+            """Render output history as ANSI fragments for the transcript window."""
+            if not getattr(cli_self._app, "full_screen", False):
+                return []
+            try:
+                rendered_lines = []
+                for entry in tuple(_OUTPUT_HISTORY):
+                    if callable(entry):
+                        try:
+                            v = entry()
+                        except Exception:
+                            continue
+                        if isinstance(v, str):
+                            rendered_lines.extend(v.splitlines())
+                        elif isinstance(v, list):
+                            rendered_lines.extend(str(x) for x in v)
+                    else:
+                        rendered_lines.append(str(entry))
+                if not rendered_lines:
+                    return []
+                from prompt_toolkit.formatted_text import to_formatted_text, ANSI
+                # Tail to a reasonable visible window — last ~120 lines.
+                tail = rendered_lines[-120:]
+                return to_formatted_text(ANSI("\n".join(tail)))
+            except Exception:
+                return []
+
+        def _transcript_visible() -> bool:
+            return bool(getattr(cli_self._app, "full_screen", False)) and bool(_OUTPUT_HISTORY)
+
+        transcript_widget = ConditionalContainer(
+            content=Window(
+                content=FormattedTextControl(_transcript_text),
+                wrap_lines=True,
+                # Anchor: as content grows, keep the bottom visible.
+                always_hide_cursor=True,
+            ),
+            filter=Condition(_transcript_visible),
+        )
+
         return [
             item for item in [
-                Window(height=0),
+                Window(height=_top_spacer_height),
+                transcript_widget,
                 sudo_widget,
                 secret_widget,
                 approval_widget,
@@ -13036,17 +13092,20 @@ class HermesCLI:
             layout=layout,
             key_bindings=kb,
             style=style,
-            # Use alt-screen by default in interactive runs. Non-alt-screen
-            # mode is fundamentally incompatible with clean column-shrink
-            # resize: the terminal preserves reflowed rows into scrollback
-            # and there is no app-side recovery that doesn't either nuke the
-            # user's pre-hermes shell history (\x1b[3J) or live with
-            # duplicated status/input bars in scrollback.  Alt-screen is
-            # what claude-code uses (its `altScreenActive` flag is on for
-            # normal runs) and what avoids the bug entirely.
+            # Alt-screen / full_screen mode is on by default. Without it,
+            # column-shrink resize permanently leaves duplicated reflowed
+            # status/input rows in the user's terminal scrollback (a
+            # fundamental terminal-emulation behavior we cannot undo
+            # without `\x1b[3J` which also nukes pre-hermes shell history).
+            # claude-code uses alt-screen for the same reason.
             #
-            # Override with HERMES_FULL_SCREEN=0 to opt back into the legacy
-            # non-alt-screen mode (with the resize duplication trade-off).
+            # Banner + chat history are mirrored into a transcript widget
+            # rendered above the chrome (see _build_tui_layout_children
+            # transcript_widget) so the in-app experience matches what
+            # users see in legacy non-alt-screen mode.
+            #
+            # Override with HERMES_FULL_SCREEN=0 to opt back into legacy
+            # non-alt-screen behavior.
             full_screen=(os.environ.get("HERMES_FULL_SCREEN", "1") not in {"0", "false", "False"}),
             mouse_support=False,
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
