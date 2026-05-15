@@ -13036,70 +13036,60 @@ class HermesCLI:
             layout=layout,
             key_bindings=kb,
             style=style,
-            full_screen=False,
+            # Use alt-screen by default in interactive runs. Non-alt-screen
+            # mode is fundamentally incompatible with clean column-shrink
+            # resize: the terminal preserves reflowed rows into scrollback
+            # and there is no app-side recovery that doesn't either nuke the
+            # user's pre-hermes shell history (\x1b[3J) or live with
+            # duplicated status/input bars in scrollback.  Alt-screen is
+            # what claude-code uses (its `altScreenActive` flag is on for
+            # normal runs) and what avoids the bug entirely.
+            #
+            # Override with HERMES_FULL_SCREEN=0 to opt back into the legacy
+            # non-alt-screen mode (with the resize duplication trade-off).
+            full_screen=(os.environ.get("HERMES_FULL_SCREEN", "1") not in {"0", "false", "False"}),
             mouse_support=False,
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
 
-        # Resize handling: prompt_toolkit's native _on_resize uses
-        # renderer.erase(), which cursor_up()s by the stored logical
-        # `_cursor_pos.y` and erase_down()s.  When columns SHRINK the
-        # terminal reflows full-width rows (status/input bars, banner)
-        # into more physical rows than pt last tracked -> cursor_up() walks
-        # up too few rows -> the stale chrome rows above never get erased
-        # -> they pile up as duplicated status bars in scrollback every
-        # time the user shrinks the window.
-        #
-        # Fix: before pt's native handler runs, inflate the renderer's
-        # tracked y so that cursor_up walks up far enough to cover the
-        # reflowed height.  Estimate worst-case extra rows as the ratio
-        # between the previous render width and the new width.
+        # Resize handling — see _hermes_resize_strategy. Default is to call
+        # prompt_toolkit's native _on_resize unmodified. Set HERMES_DEBUG_RESIZE=1
+        # to log every SIGWINCH with renderer state for diagnosis.
         _original_on_resize = app._on_resize
         _debug_resize = bool(os.environ.get("HERMES_DEBUG_RESIZE"))
+        _strategy = (os.environ.get("HERMES_RESIZE_STRATEGY") or "native").strip().lower()
 
-        def _on_resize_with_reflow_fix():
+        def _hermes_on_resize():
             try:
                 renderer = app.renderer
                 size = renderer.output.get_size()
                 last_size = getattr(renderer, "_last_size", None)
                 last_y = getattr(getattr(renderer, "_cursor_pos", None), "y", 0)
-                inflated_y = last_y
-                if last_size is not None and size.columns and last_size.columns:
-                    if size.columns < last_size.columns and last_y > 0:
-                        # Worst-case row inflation under column reflow.
-                        # Multiply tracked y by old/new width ratio and add
-                        # a small margin for ANSI wrapping edges.
-                        ratio = last_size.columns / max(1, size.columns)
-                        inflated_y = int(last_y * ratio) + 4
-                        # Don't try to walk above the screen.
-                        inflated_y = min(inflated_y, size.rows - 1)
-                        # Point is a NamedTuple — replace, don't mutate.
-                        try:
-                            renderer._cursor_pos = renderer._cursor_pos._replace(
-                                x=0, y=inflated_y
-                            )
-                        except Exception:
-                            try:
-                                renderer._cursor_pos = type(renderer._cursor_pos)(
-                                    x=0, y=inflated_y
-                                )
-                            except Exception:
-                                pass
                 if _debug_resize:
                     logger.warning(
-                        "HERMES_DEBUG_RESIZE size=%sx%s last=%s tracked_y=%s -> inflated_y=%s",
-                        size.columns, size.rows,
-                        (last_size.columns, last_size.rows) if last_size else None,
-                        last_y, inflated_y,
+                        "HERMES_RESIZE size=(rows=%s,cols=%s) last=%s tracked_y=%s strategy=%s",
+                        size.rows, size.columns,
+                        (last_size.rows, last_size.columns) if last_size else None,
+                        last_y, _strategy,
                     )
+                if _strategy == "clear" and last_size and size.columns < last_size.columns:
+                    # Column shrink: pt's stored y is too small to cover the
+                    # reflow extras above. Use a hard viewport clear so reflowed
+                    # full-width rows don't survive into scrollback.
+                    out = renderer.output
+                    out.reset_attributes()
+                    out.erase_screen()
+                    out.cursor_goto(0, 0)
+                    out.flush()
+                    renderer.reset(leave_alternate_screen=False)
             except Exception as e:
                 if _debug_resize:
-                    logger.warning("HERMES_DEBUG_RESIZE pre-fix error: %s", e)
+                    logger.warning("HERMES_RESIZE pre-pass error: %s", e)
             _original_on_resize()
 
-        app._on_resize = _on_resize_with_reflow_fix
+        app._on_resize = _hermes_on_resize
 
         def spinner_loop():
             while not self._should_exit:
